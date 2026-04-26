@@ -499,13 +499,12 @@ async function searchCourses() {
 
     resultsEl.innerHTML = courses.slice(0, 15).map((c, i) => {
       const name = c.club_name || c.course_name || 'Unknown';
-      const loc = [c.location?.city, c.location?.state, c.location?.country].filter(Boolean).join(', ');
-      // Count holes from tee_boxes if available
-      const teeBox = c.tee_boxes?.[0];
-      const holeCount = teeBox?.holes?.length || c.number_of_holes || '?';
+      const loc = [c.location?.city, c.location?.state, c.location?.country].filter(v => v && v !== 'Unknown').join(', ');
+      const maleTees = c.tees?.male || [];
+      const holeCount = maleTees[0]?.number_of_holes || maleTees[0]?.holes?.length || '?';
       return `<div class="search-result-item" onclick="loadCourse(${i})">
         <div class="sri-name">${name}</div>
-        <div class="sri-sub">${loc}${holeCount !== '?' ? ' · ' + holeCount + ' holes' : ''}</div>
+        <div class="sri-sub">${loc ? loc + ' · ' : ''}${holeCount !== '?' ? holeCount + ' holes' : ''}</div>
       </div>`;
     }).join('');
 
@@ -521,34 +520,29 @@ function loadCourse(idx) {
   const resultsEl = document.getElementById('search-results');
 
   try {
-    // The search result already contains all course data including tee_boxes with holes
-    // Find the best tee box — prefer "mens", "gents", "white", or just use the first one
-    const teeBoxes = course.tee_boxes || [];
-    let teeBox = teeBoxes.find(t => /men|gent|white|medal/i.test(t.tee_name || ''))
-                 || teeBoxes[0];
+    // API returns hole data inside tees.male[0].holes or tees.female[0].holes
+    const maleTees = course.tees?.male || [];
+    const femaleTees = course.tees?.female || [];
+    const tee = (maleTees.length ? maleTees : femaleTees)[0];
 
-    if (!teeBox || !teeBox.holes || !teeBox.holes.length) {
-      // Try getting holes directly from the course object
-      const directHoles = course.holes || [];
-      if (!directHoles.length) {
-        resultsEl.innerHTML = '<div class="search-status">⚠️ No hole data found for this course. Try searching for it by a slightly different name.</div>';
-        return;
-      }
-      // Build from direct holes array
-      buildCourseFromHoles(course, directHoles.map(h => ({
-        hole_num: h.hole_num || h.number || h.hole,
-        par: h.par,
-        handicap: h.handicap || h.stroke_index || h.hole_num
-      })));
+    if (!tee || !tee.holes || !tee.holes.length) {
+      resultsEl.innerHTML = '<div class="search-status">⚠️ No hole data found for this course. Try another.</div>';
       return;
     }
 
-    // Build holes from tee box data
-    const holes = [...teeBox.holes].sort((a, b) => (a.hole_num || a.number) - (b.hole_num || b.number));
-    buildCourseFromHoles(course, holes.map(h => ({
-      hole_num: h.hole_num || h.number,
+    const numHoles = tee.number_of_holes || tee.holes.length;
+    const rawHoles = tee.holes.slice(0, numHoles);
+
+    // API doesn't provide stroke index so we derive it from yardage (longer = harder = lower SI)
+    const withIdx = rawHoles.map((h, i) => ({ ...h, holeNum: i + 1 }));
+    const sortedByYardage = [...withIdx].sort((a, b) => (b.yardage || 0) - (a.yardage || 0));
+    const siMap = {};
+    sortedByYardage.forEach((h, i) => { siMap[h.holeNum] = i + 1; });
+
+    buildCourseFromHoles(course, withIdx.map(h => ({
+      hole_num: h.holeNum,
       par: h.par,
-      handicap: h.handicap || h.stroke_index || h.hole_num || h.number
+      handicap: siMap[h.holeNum] || h.holeNum
     })));
 
   } catch(e) {
