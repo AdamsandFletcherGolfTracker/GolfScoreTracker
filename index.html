@@ -361,15 +361,45 @@ function setSyncStatus(state, msg) {
 }
 
 // ── Google Sheets ────────────────────────────────────────
+// Use a script-tag based fetch to bypass CORS for GET requests
+function fetchFromSheetsViaScript() {
+  return new Promise((resolve, reject) => {
+    const callbackName = 'gsCallback_' + Date.now();
+    const script = document.createElement('script');
+    const timeout = setTimeout(() => {
+      delete window[callbackName];
+      document.body.removeChild(script);
+      reject(new Error('Timeout'));
+    }, 10000);
+
+    window[callbackName] = (data) => {
+      clearTimeout(timeout);
+      delete window[callbackName];
+      try { document.body.removeChild(script); } catch(e) {}
+      resolve(data);
+    };
+
+    script.src = SHEET_URL + '?callback=' + callbackName + '&t=' + Date.now();
+    script.onerror = () => { clearTimeout(timeout); reject(new Error('Script error')); };
+    document.body.appendChild(script);
+  });
+}
+
 async function fetchFromSheets() {
   setSyncStatus('spin', 'Syncing…');
   try {
+    // Try standard fetch first (works on some setups)
     const res = await fetch(SHEET_URL + '?t=' + Date.now());
+    if (!res.ok) throw new Error('Bad response');
     const rows = await res.json();
-    rounds = rows
-      .filter(r => r && r[0])
-      .map(r => { try { return JSON.parse(r[0]); } catch(e) { return null; } })
-      .filter(Boolean);
+    // Updated Apps Script returns parsed objects directly
+    rounds = Array.isArray(rows) ? rows.filter(Boolean) : [];
+    // Handle both old format (array of [jsonString]) and new format (array of objects)
+    if (rounds.length && Array.isArray(rounds[0])) {
+      rounds = rounds.filter(r => r[0]).map(r => {
+        try { return JSON.parse(r[0]); } catch(e) { return null; }
+      }).filter(Boolean);
+    }
     rounds.sort((a, b) => a.date.localeCompare(b.date));
     localStorage.setItem('golf-cache', JSON.stringify(rounds));
     const now = new Date().toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
@@ -456,6 +486,7 @@ async function searchCourses() {
     }
 
     const data = await res.json();
+    console.log('GolfCourseAPI search response:', JSON.stringify(data).slice(0, 500));
     const courses = data.courses || [];
 
     if (!courses.length) {
@@ -463,99 +494,120 @@ async function searchCourses() {
       return;
     }
 
-    resultsEl.innerHTML = courses.slice(0, 15).map((c, i) => {
-      const loc = [c.club?.city, c.club?.state, c.club?.country].filter(Boolean).join(', ');
-      const holes = c.holes ? c.holes.length : '?';
-      return `<div class="search-result-item" onclick="loadCourse(${i})">
-        <div class="sri-name">${c.club?.club_name || c.course_name || 'Unknown'}</div>
-        <div class="sri-sub">${loc} · ${holes} holes</div>
-      </div>`;
-    }).join('');
-
     // Store results for later access
     window._searchResults = courses.slice(0, 15);
+
+    resultsEl.innerHTML = courses.slice(0, 15).map((c, i) => {
+      const name = c.club_name || c.course_name || 'Unknown';
+      const loc = [c.location?.city, c.location?.state, c.location?.country].filter(Boolean).join(', ');
+      // Count holes from tee_boxes if available
+      const teeBox = c.tee_boxes?.[0];
+      const holeCount = teeBox?.holes?.length || c.number_of_holes || '?';
+      return `<div class="search-result-item" onclick="loadCourse(${i})">
+        <div class="sri-name">${name}</div>
+        <div class="sri-sub">${loc}${holeCount !== '?' ? ' · ' + holeCount + ' holes' : ''}</div>
+      </div>`;
+    }).join('');
 
   } catch(e) {
     resultsEl.innerHTML = '<div class="search-status">Search failed — check your internet connection.</div>';
   }
 }
 
-async function loadCourse(idx) {
+function loadCourse(idx) {
   const course = window._searchResults?.[idx];
   if (!course) return;
 
-  const key = getApiKey();
   const resultsEl = document.getElementById('search-results');
-  resultsEl.innerHTML = '<div class="search-status">Loading course data…</div>';
 
   try {
-    // Fetch full course details including hole-by-hole data
-    const courseId = course.id;
-    const url = `https://api.golfcourseapi.com/v1/courses/${courseId}`;
-    const res = await fetch(url, { headers: { 'Authorization': 'Key ' + key } });
+    // The search result already contains all course data including tee_boxes with holes
+    // Find the best tee box — prefer "mens", "gents", "white", or just use the first one
+    const teeBoxes = course.tee_boxes || [];
+    let teeBox = teeBoxes.find(t => /men|gent|white|medal/i.test(t.tee_name || ''))
+                 || teeBoxes[0];
 
-    if (!res.ok) throw new Error('Failed to load course');
-    const data = await res.json();
-    const fullCourse = data.course || data;
-
-    const holes = (fullCourse.holes || []).sort((a, b) => a.hole_num - b.hole_num);
-    if (!holes.length) {
-      resultsEl.innerHTML = '<div class="search-status">⚠️ No hole data available for this course. Try another course or tee.</div>';
+    if (!teeBox || !teeBox.holes || !teeBox.holes.length) {
+      // Try getting holes directly from the course object
+      const directHoles = course.holes || [];
+      if (!directHoles.length) {
+        resultsEl.innerHTML = '<div class="search-status">⚠️ No hole data found for this course. Try searching for it by a slightly different name.</div>';
+        return;
+      }
+      // Build from direct holes array
+      buildCourseFromHoles(course, directHoles.map(h => ({
+        hole_num: h.hole_num || h.number || h.hole,
+        par: h.par,
+        handicap: h.handicap || h.stroke_index || h.hole_num
+      })));
       return;
     }
 
-    // Build hole data — use men's tee par + handicap
-    const builtHoles = holes.map(h => {
-      // Par: try mens_par, then par, default to 4
-      const par = parseInt(h.mens_par || h.par || 4);
-      // Stroke index: try mens_handicap, handicap, or fallback to hole number
-      const si = parseInt(h.mens_handicap || h.handicap || h.hole_num);
-      return { n: h.hole_num, par, si };
-    });
-
-    const courseName = fullCourse.club_name || fullCourse.course_name || course.club?.club_name || 'Unknown Course';
-    const location = [fullCourse.city, fullCourse.country].filter(Boolean).join(', ');
-    const totalPar = builtHoles.reduce((a, h) => a + h.par, 0);
-    const numHoles = builtHoles.length;
-
-    // Split into halves
-    const halves = numHoles <= 9
-      ? [{ label: 'All ' + numHoles + ' Holes', tot: 'Total', start: 0, end: numHoles }]
-      : [
-          { label: 'Front 9 — Holes 1–9', tot: 'Out', start: 0, end: 9 },
-          { label: 'Back 9 — Holes 10–18', tot: 'In', start: 9, end: numHoles }
-        ];
-
-    // Register as a dynamic course
-    COURSES['_trackman'] = {
-      name: courseName + (location ? ' · ' + location : ''),
-      holes: builtHoles,
-      halves
-    };
-
-    // Switch to it
-    activeCourse = '_trackman';
-    holeWinners = {};
-    ['pill-silkstone', 'pill-owston', 'pill-trackman'].forEach(id => {
-      document.getElementById(id)?.classList.remove('active');
-    });
-    document.getElementById('pill-trackman').classList.add('active');
-
-    // Show banner
-    const banner = document.getElementById('loaded-course-banner');
-    banner.textContent = '✓ Loaded: ' + courseName + ' · ' + numHoles + ' holes · Par ' + totalPar;
-    banner.style.display = 'block';
-
-    // Clear results
-    resultsEl.innerHTML = '';
-    document.getElementById('course-search-input').value = '';
-
-    // Build the scorecard
-    buildScorecard();
+    // Build holes from tee box data
+    const holes = [...teeBox.holes].sort((a, b) => (a.hole_num || a.number) - (b.hole_num || b.number));
+    buildCourseFromHoles(course, holes.map(h => ({
+      hole_num: h.hole_num || h.number,
+      par: h.par,
+      handicap: h.handicap || h.stroke_index || h.hole_num || h.number
+    })));
 
   } catch(e) {
-    resultsEl.innerHTML = '<div class="search-status">Failed to load course details. Try another course.</div>';
+    console.error('Load course error:', e);
+    resultsEl.innerHTML = '<div class="search-status">Failed to load course. Please try another.</div>';
   }
+}
+
+function buildCourseFromHoles(course, holeData) {
+  const resultsEl = document.getElementById('search-results');
+
+  // Filter valid holes with a par value
+  const validHoles = holeData.filter(h => h.hole_num && h.par && parseInt(h.par) > 0);
+
+  if (!validHoles.length) {
+    resultsEl.innerHTML = '<div class="search-status">⚠️ This course has no par data. Try another course.</div>';
+    return;
+  }
+
+  const builtHoles = validHoles.map(h => ({
+    n: parseInt(h.hole_num),
+    par: parseInt(h.par),
+    si: parseInt(h.handicap) || parseInt(h.hole_num)
+  }));
+
+  const courseName = course.club_name || course.course_name || 'Unknown Course';
+  const loc = course.location || {};
+  const location = [loc.city, loc.country].filter(Boolean).join(', ');
+  const totalPar = builtHoles.reduce((a, h) => a + h.par, 0);
+  const numHoles = builtHoles.length;
+
+  const halves = numHoles <= 9
+    ? [{ label: 'All ' + numHoles + ' Holes', tot: 'Total', start: 0, end: numHoles }]
+    : [
+        { label: 'Front 9 — Holes 1–9', tot: 'Out', start: 0, end: 9 },
+        { label: 'Back 9 — Holes 10–18', tot: 'In', start: 9, end: numHoles }
+      ];
+
+  COURSES['_trackman'] = {
+    name: courseName + (location ? ' · ' + location : ''),
+    holes: builtHoles,
+    halves
+  };
+
+  activeCourse = '_trackman';
+  holeWinners = {};
+  ['pill-silkstone', 'pill-owston', 'pill-trackman'].forEach(id => {
+    document.getElementById(id)?.classList.remove('active');
+  });
+  document.getElementById('pill-trackman').classList.add('active');
+
+  const banner = document.getElementById('loaded-course-banner');
+  banner.textContent = '✓ Loaded: ' + courseName + ' · ' + numHoles + ' holes · Par ' + totalPar;
+  banner.style.display = 'block';
+
+  resultsEl.innerHTML = '';
+  document.getElementById('course-search-input').value = '';
+
+  buildScorecard();
 }
 
 // ── Stableford calculation ───────────────────────────────
